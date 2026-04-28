@@ -1,0 +1,481 @@
+"""
+Traffic Speed & TTI Forecasting with LightGBM
+Targets : target_speed (mph), target_tti (Travel Time Index)
+Input   : master_dataset.parquet (15-min interval traffic records)
+"""
+
+#IMPORTS
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.ticker as mticker
+from scipy import stats
+
+import lightgbm as lgb
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    mean_absolute_percentage_error,
+    r2_score,
+)
+from sklearn.preprocessing import LabelEncoder
+import warnings
+
+warnings.filterwarnings("ignore")
+
+COLORS = {
+    "bg":         "#FFFFFF",
+    "panel_bg":   "#FAFAF8",
+    "grid":       "#E5E4DF",
+    "text":       "#1A1A1A",
+    "text_mid":   "#5C5B57",
+    "text_light": "#9C9B95",
+    "teal":       "#0F6E56",
+    "teal_lt":    "#5DCAA5",
+    "coral":      "#D85A30",
+    "coral_lt":   "#F0997B",
+    "purple":     "#534AB7",
+    "purple_lt":  "#AFA9EC",
+    "amber":      "#BA7517",
+    "amber_lt":   "#FAC775",
+    "red":        "#A32D2D",
+}
+
+plt.rcParams.update({
+    # Typography
+    "font.family":        "sans-serif",
+    "font.sans-serif":    ["Helvetica Neue", "Helvetica", "DejaVu Sans"],
+    "font.size":          9,
+    "axes.titlesize":     10,
+    "axes.titleweight":   "bold",
+    "axes.labelsize":     9,
+    "xtick.labelsize":    8,
+    "ytick.labelsize":    8,
+    "legend.fontsize":    8,
+    # Canvas
+    "figure.facecolor":   COLORS["bg"],
+    "axes.facecolor":     COLORS["bg"],
+    "axes.edgecolor":     COLORS["grid"],
+    "axes.labelcolor":    COLORS["text"],
+    "xtick.color":        COLORS["text_mid"],
+    "ytick.color":        COLORS["text_mid"],
+    "text.color":         COLORS["text"],
+    # Grid
+    "axes.grid":          True,
+    "grid.color":         COLORS["grid"],
+    "grid.linewidth":     0.5,
+    "grid.alpha":         0.7,
+    # Spines
+    "axes.spines.top":    False,
+    "axes.spines.right":  False,
+    "axes.linewidth":     0.6,
+    # Lines
+    "lines.linewidth":    1.2,
+    # Export
+    "savefig.dpi":        300,
+    "savefig.bbox":       "tight",
+    "savefig.facecolor":  COLORS["bg"],
+    "savefig.pad_inches": 0.15,
+})
+
+
+def _style(ax, xlabel=None, ylabel=None, label=None):
+    """Apply journal styling + optional (a)/(b) panel label."""
+    if xlabel:
+        ax.set_xlabel(xlabel, labelpad=6)
+    if ylabel:
+        ax.set_ylabel(ylabel, labelpad=6)
+    ax.tick_params(axis="both", length=3, width=0.5)
+    for sp in ax.spines.values():
+        sp.set_color(COLORS["grid"])
+    if label:
+        ax.text(
+            -0.02, 1.06, label,
+            transform=ax.transAxes, fontsize=11,
+            fontweight="bold", color=COLORS["text"], va="bottom", ha="right",
+        )
+
+
+def _legend(ax, **kw):
+    defaults = dict(
+        frameon=True, facecolor=COLORS["bg"],
+        edgecolor=COLORS["grid"], borderpad=0.5,
+        handlelength=1.6, handletextpad=0.5,
+    )
+    defaults.update(kw)
+    ax.legend(**defaults)
+
+
+
+#LOAD DATA
+df = pd.read_parquet("outputs/phase2_master_dataset/master_dataset.parquet")
+print(f"Loaded: {df.shape[0]:,} rows × {df.shape[1]} cols")
+print(f"Date range: {df['timestamp'].min()} → {df['timestamp'].max()}")
+
+
+
+# Temporal feature extraction
+df = df.copy()
+df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+df["hour"]         = df["timestamp"].dt.hour
+df["minute"]       = df["timestamp"].dt.minute
+df["day_of_week"]  = df["timestamp"].dt.dayofweek
+df["day_of_month"] = df["timestamp"].dt.day
+df["month"]        = df["timestamp"].dt.month
+df["is_weekend"]   = (df["day_of_week"] >= 5).astype(int)
+
+df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
+df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+df["dow_sin"]  = np.sin(2 * np.pi * df["day_of_week"] / 7)
+df["dow_cos"]  = np.cos(2 * np.pi * df["day_of_week"] / 7)
+
+# Encode categoricals
+label_encoders = {}
+categorical_cols = ["tmc_code", "direction", "county"]
+for col in categorical_cols:
+    le = LabelEncoder()
+    df[col] = le.fit_transform(df[col].astype(str))
+    label_encoders[col] = le
+    print(f"  Encoded '{col}': {len(le.classes_)} classes")
+
+# Handle missing values
+missing = df.isnull().sum().sum()
+if missing > 0:
+    num_cols = df.select_dtypes(include=[np.number]).columns
+    df[num_cols] = df[num_cols].ffill().bfill()
+    print(f"  Filled {missing} missing values (forward/backward fill)")
+
+print(f"  Final shape: {df.shape}")
+
+#FEATURE / TARGET SPLIT
+target_cols = ["target_speed", "target_tti"]
+drop_cols   = ["timestamp"]
+feature_cols = [c for c in df.columns if c not in target_cols + drop_cols]
+cat_feature_names = [c for c in categorical_cols if c in feature_cols]
+
+print(f"\nFeatures : {len(feature_cols)}")
+print(f"Targets  : {target_cols}")
+
+#CHRONOLOGICAL TRAIN / VAL / TEST SPLIT 
+
+df = df.sort_values("timestamp").reset_index(drop=True)
+n = len(df)
+i_train = int(n * 0.70)
+i_val   = int(n * 0.85)
+
+train_df = df.iloc[:i_train]
+val_df   = df.iloc[i_train:i_val]
+test_df  = df.iloc[i_val:]
+
+X_train, X_val, X_test = train_df[feature_cols], val_df[feature_cols], test_df[feature_cols]
+y_train_s, y_val_s, y_test_s = train_df["target_speed"], val_df["target_speed"], test_df["target_speed"]
+y_train_t, y_val_t, y_test_t = train_df["target_tti"],   val_df["target_tti"],   test_df["target_tti"]
+
+print(f"\nTrain : {len(train_df):>8,} rows   {df['timestamp'].iloc[0].date()} → {df['timestamp'].iloc[i_train-1].date()}")
+print(f"Val   : {len(val_df):>8,} rows   {df['timestamp'].iloc[i_train].date()} → {df['timestamp'].iloc[i_val-1].date()}")
+print(f"Test  : {len(test_df):>8,} rows   {df['timestamp'].iloc[i_val].date()} → {df['timestamp'].iloc[-1].date()}")
+
+
+# LIGHTGBM TRAINING
+
+params = {
+    "objective":        "regression",
+    "metric":           "mae",
+    "boosting_type":    "gbdt",
+    "num_leaves":       63,
+    "learning_rate":    0.05,
+    "n_estimators":     2000,
+    "min_child_samples": 20,
+    "subsample":        0.8,
+    "colsample_bytree": 0.8,
+    "reg_alpha":        0.1,
+    "reg_lambda":       1.0,
+    "random_state":     42,
+    "n_jobs":           -1,
+    "verbose":          -1,
+}
+
+cb = [lgb.early_stopping(50, verbose=True), lgb.log_evaluation(200)]
+
+#Speed model 
+print("\n" + "=" * 60)
+print("  Training: target_speed")
+print("=" * 60)
+model_speed = lgb.LGBMRegressor(**params)
+model_speed.fit(X_train, y_train_s,
+                eval_set=[(X_val, y_val_s)], eval_metric="mae",
+                callbacks=cb, categorical_feature=cat_feature_names)
+print(f"  Best iter: {model_speed.best_iteration_}")
+
+#TTI model
+print("\n" + "=" * 60)
+print("  Training: target_tti")
+print("=" * 60)
+model_tti = lgb.LGBMRegressor(**params)
+model_tti.fit(X_train, y_train_t,
+              eval_set=[(X_val, y_val_t)], eval_metric="mae",
+              callbacks=cb, categorical_feature=cat_feature_names)
+print(f"  Best iter: {model_tti.best_iteration_}")
+
+#EVALUATION
+pred_speed = model_speed.predict(X_test)
+pred_tti   = model_tti.predict(X_test)
+
+err_speed = y_test_s.values - pred_speed
+err_tti   = y_test_t.values - pred_tti
+
+
+def metrics(y, yhat):
+    return {
+        "MAE":  mean_absolute_error(y, yhat),
+        "RMSE": np.sqrt(mean_squared_error(y, yhat)),
+        "MAPE": mean_absolute_percentage_error(y, yhat) * 100,
+        "R2":   r2_score(y, yhat),
+    }
+
+
+m_speed = metrics(y_test_s, pred_speed)
+m_tti   = metrics(y_test_t, pred_tti)
+
+print("\n" + "=" * 60)
+print(f"  Speed — MAE: {m_speed['MAE']:.4f}  RMSE: {m_speed['RMSE']:.4f}  "
+      f"MAPE: {m_speed['MAPE']:.2f}%  R²: {m_speed['R2']:.4f}")
+print(f"  TTI   — MAE: {m_tti['MAE']:.4f}  RMSE: {m_tti['RMSE']:.4f}  "
+      f"MAPE: {m_tti['MAPE']:.2f}%  R²: {m_tti['R2']:.4f}")
+print("=" * 60)
+
+#Cross-validation
+print("\nRunning 5-fold TimeSeriesSplit CV …")
+X_cv = pd.concat([X_train, X_val])
+y_cv_s = pd.concat([y_train_s, y_val_s])
+y_cv_t = pd.concat([y_train_t, y_val_t])
+
+cv_s, cv_t = [], []
+for fold, (ti, vi) in enumerate(TimeSeriesSplit(n_splits=5).split(X_cv), 1):
+    Xtr, Xvl = X_cv.iloc[ti], X_cv.iloc[vi]
+
+    ms = lgb.LGBMRegressor(**params)
+    ms.fit(Xtr, y_cv_s.iloc[ti], eval_set=[(Xvl, y_cv_s.iloc[vi])],
+           callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)],
+           categorical_feature=cat_feature_names)
+    cv_s.append(mean_absolute_error(y_cv_s.iloc[vi], ms.predict(Xvl)))
+
+    mt = lgb.LGBMRegressor(**params)
+    mt.fit(Xtr, y_cv_t.iloc[ti], eval_set=[(Xvl, y_cv_t.iloc[vi])],
+           callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)],
+           categorical_feature=cat_feature_names)
+    cv_t.append(mean_absolute_error(y_cv_t.iloc[vi], mt.predict(Xvl)))
+
+    print(f"  Fold {fold}:  Speed MAE = {cv_s[-1]:.4f}  |  TTI MAE = {cv_t[-1]:.4f}")
+
+print(f"\n  CV Speed MAE: {np.mean(cv_s):.4f} ± {np.std(cv_s):.4f}")
+print(f"  CV TTI   MAE: {np.mean(cv_t):.4f} ± {np.std(cv_t):.4f}")
+
+#Save artefacts 
+model_speed.booster_.save_model("model_speed_lgbm.txt")
+model_tti.booster_.save_model("model_tti_lgbm.txt")
+
+results = test_df[["timestamp", "tmc_code"]].copy()
+results["actual_speed"]    = y_test_s.values
+results["predicted_speed"] = pred_speed
+results["actual_tti"]      = y_test_t.values
+results["predicted_tti"]   = pred_tti
+results.to_csv("test_predictions.csv", index=False)
+print("\nSaved: model_speed_lgbm.txt, model_tti_lgbm.txt, test_predictions.csv")
+
+
+
+#  Figure 1: Actual vs Predicted — Time Series 
+window = min(192, len(test_df))
+ts   = test_df["timestamp"].values[:window]
+a_s  = y_test_s.values[:window]
+p_s  = pred_speed[:window]
+a_t  = y_test_t.values[:window]
+p_t  = pred_tti[:window]
+
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.2, 4.2), sharex=True)
+
+ax1.fill_between(ts, a_s, p_s, alpha=0.10, color=COLORS["coral"], lw=0)
+ax1.plot(ts, a_s, color=COLORS["teal"],  lw=1.3, label="Actual")
+ax1.plot(ts, p_s, color=COLORS["coral"], lw=1.0, ls="--", alpha=0.85, label="Predicted")
+_style(ax1, ylabel="Speed (mph)", label="(a)")
+_legend(ax1, loc="upper right")
+
+ax2.fill_between(ts, a_t, p_t, alpha=0.10, color=COLORS["purple"], lw=0)
+ax2.plot(ts, a_t, color=COLORS["teal"],   lw=1.3, label="Actual")
+ax2.plot(ts, p_t, color=COLORS["purple"], lw=1.0, ls="--", alpha=0.85, label="Predicted")
+_style(ax2, xlabel="Time", ylabel="TTI", label="(b)")
+_legend(ax2, loc="upper right")
+
+fig.autofmt_xdate(rotation=30, ha="right")
+plt.tight_layout()
+plt.savefig("fig1_actual_vs_predicted.png")
+plt.savefig("fig1_actual_vs_predicted.pdf")
+plt.show()
+print("Saved: fig1_actual_vs_predicted.png / .pdf")
+
+
+#Scatter — Actual vs Predicted 
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.2, 3.4))
+
+for ax, actual, pred, color, unit, label in [
+    (ax1, y_test_s.values, pred_speed, COLORS["teal"],   "mph", "(a)"),
+    (ax2, y_test_t.values, pred_tti,   COLORS["purple"], "TTI", "(b)"),
+]:
+    ax.scatter(actual, pred, s=2, alpha=0.10, color=color, edgecolors="none", rasterized=True)
+
+    lo = min(actual.min(), pred.min())
+    hi = max(actual.max(), pred.max())
+    pad = (hi - lo) * 0.04
+    lims = [lo - pad, hi + pad]
+    ax.plot(lims, lims, ls="--", lw=1.0, color=COLORS["red"], alpha=0.55)
+
+    slope, intercept, r_val, _, _ = stats.linregress(actual, pred)
+    fit_x = np.linspace(lims[0], lims[1], 100)
+    ax.plot(fit_x, slope * fit_x + intercept,
+            color=COLORS["amber"], lw=1.0, alpha=0.7)
+
+    r2 = r_val ** 2
+    ax.text(0.06, 0.90, f"$R^2 = {r2:.4f}$",
+            transform=ax.transAxes, fontsize=9, color=COLORS["text"],
+            bbox=dict(boxstyle="round,pad=0.3", fc=COLORS["bg"],
+                      ec=COLORS["grid"], lw=0.5))
+
+    ax.set_xlim(lims)
+    ax.set_ylim(lims)
+    ax.set_aspect("equal")
+    _style(ax, xlabel=f"Actual ({unit})", ylabel=f"Predicted ({unit})", label=label)
+
+plt.tight_layout()
+plt.savefig("fig2_scatter_calibration.png")
+plt.savefig("fig2_scatter_calibration.pdf")
+plt.show()
+print("Saved: fig2_scatter_calibration.png / .pdf")
+
+
+#Figure 3: Feature Importance — Lollipop
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.2, 4.0))
+
+for ax, model, color, color_lt, label in [
+    (ax1, model_speed, COLORS["teal"],   COLORS["teal_lt"],   "(a)"),
+    (ax2, model_tti,   COLORS["purple"], COLORS["purple_lt"], "(b)"),
+]:
+    imp = pd.Series(model.feature_importances_,
+                     index=feature_cols).sort_values().tail(15)
+    yp = np.arange(len(imp))
+
+    ax.hlines(yp, 0, imp.values, color=color_lt, lw=2.0, zorder=2)
+    ax.scatter(imp.values, yp, color=color, s=36,
+               edgecolors="white", linewidths=0.8, zorder=3)
+
+    ax.set_yticks(yp)
+    ax.set_yticklabels(imp.index, fontsize=7.5)
+    ax.set_xlim(left=0)
+    _style(ax, xlabel="Importance (gain)", label=label)
+
+plt.tight_layout()
+plt.savefig("fig3_feature_importance.png")
+plt.savefig("fig3_feature_importance.pdf")
+plt.show()
+print("Saved: fig3_feature_importance.png / .pdf")
+
+
+#Figure 4: Error Distribution — KDE + Rug 
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.2, 3.2))
+
+for ax, err, color, color_lt, unit, label in [
+    (ax1, err_speed, COLORS["coral"],  COLORS["coral_lt"],  "mph", "(a)"),
+    (ax2, err_tti,   COLORS["purple"], COLORS["purple_lt"], "TTI", "(b)"),
+]:
+    kde_x = np.linspace(err.min() - 1, err.max() + 1, 500)
+    kde   = stats.gaussian_kde(err)
+
+    ax.fill_between(kde_x, kde(kde_x), alpha=0.18, color=color_lt, lw=0)
+    ax.plot(kde_x, kde(kde_x), color=color, lw=1.4)
+
+    # Rug
+    ax.plot(err, np.full_like(err, -0.003 * kde(kde_x).max()),
+            "|", color=color, alpha=0.06, markersize=5)
+
+    ax.axvline(0, color=COLORS["text_light"], lw=0.7, alpha=0.4)
+    ax.axvline(np.mean(err), color=COLORS["red"],   ls="--", lw=1.0,
+               label=f"Mean = {np.mean(err):+.3f}")
+    ax.axvline(np.median(err), color=COLORS["amber"], ls=":", lw=1.0,
+               label=f"Median = {np.median(err):+.3f}")
+
+    _style(ax, xlabel=f"Error ({unit})", ylabel="Density", label=label)
+    _legend(ax, loc="upper left", fontsize=7)
+
+plt.tight_layout()
+plt.savefig("fig4_error_distribution.png")
+plt.savefig("fig4_error_distribution.pdf")
+plt.show()
+print("Saved: fig4_error_distribution.png / .pdf")
+
+
+#Figure 5: Error by Hour of Day — Box Plot 
+hours = test_df["hour"].values
+hour_groups_s = [err_speed[hours == h] for h in range(24)]
+hour_groups_t = [err_tti[hours == h]   for h in range(24)]
+
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.2, 4.6), sharex=True)
+
+def _box(ax, groups, fill, edge, med_col, ylabel, label):
+    bp = ax.boxplot(
+        groups, positions=range(24), widths=0.55,
+        patch_artist=True, showfliers=False,
+        medianprops  = dict(color=med_col, lw=1.5),
+        whiskerprops = dict(color=COLORS["text_light"], lw=0.6),
+        capprops     = dict(color=COLORS["text_light"], lw=0.6),
+    )
+    for p in bp["boxes"]:
+        p.set_facecolor(fill)
+        p.set_edgecolor(edge)
+        p.set_alpha(0.45)
+        p.set_linewidth(0.6)
+    ax.axhline(0, color=COLORS["text_light"], lw=0.7, alpha=0.35)
+    # Rush-hour bands
+    for s, e in [(7, 9), (16, 18)]:
+        ax.axvspan(s - 0.5, e + 0.5, alpha=0.05, color=COLORS["amber"], zorder=0)
+    _style(ax, ylabel=ylabel, label=label)
+
+_box(ax1, hour_groups_s, COLORS["teal_lt"], COLORS["teal"],
+     COLORS["coral"], "Speed error (mph)", "(a)")
+_box(ax2, hour_groups_t, COLORS["purple_lt"], COLORS["purple"],
+     COLORS["amber"], "TTI error", "(b)")
+
+ax2.set_xticks(range(24))
+ax2.set_xticklabels([f"{h:02d}" for h in range(24)], fontsize=7)
+_style(ax2, xlabel="Hour of day")
+
+plt.tight_layout()
+plt.savefig("fig5_error_by_hour.png")
+plt.savefig("fig5_error_by_hour.pdf")
+plt.show()
+print("Saved: fig5_error_by_hour.png / .pdf")
+
+
+
+
+print("\n" + "═" * 60)
+print("  PIPELINE COMPLETE")
+print("═" * 60)
+print(f"  Train / Val / Test     : {len(train_df):,} / {len(val_df):,} / {len(test_df):,}")
+print(f"  Features               : {len(feature_cols)}")
+print(f"  Speed — MAE: {m_speed['MAE']:.4f}  R²: {m_speed['R2']:.4f}")
+print(f"  TTI   — MAE: {m_tti['MAE']:.4f}  R²: {m_tti['R2']:.4f}")
+print(f"  CV Speed MAE           : {np.mean(cv_s):.4f} ± {np.std(cv_s):.4f}")
+print(f"  CV TTI   MAE           : {np.mean(cv_t):.4f} ± {np.std(cv_t):.4f}")
+print("─" * 60)
+print("  Figures (300 DPI, PNG + PDF):")
+print("    fig1_actual_vs_predicted   — Time series overlay")
+print("    fig2_scatter_calibration   — Actual vs predicted scatter")
+print("    fig3_feature_importance    — Top-15 lollipop chart")
+print("    fig4_error_distribution    — KDE density + rug")
+print("    fig5_error_by_hour         — Hourly box plot")
+print("═" * 60)
+
+
